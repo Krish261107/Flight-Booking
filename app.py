@@ -174,7 +174,6 @@ def main():
     signed_in = sidebar_account()
     if not signed_in:
         st.title("Fly smarter with Skylink Airlines \u2708\ufe0f")
-        st.caption("A fully dummy demo booking experience \u2014 no real flights, no real payments.")
         st.info("Log in, sign up, or continue as **Guest** from the sidebar to start searching flights.")
         return
 

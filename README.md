@@ -1,4 +1,4 @@
-# SkyDummy Airlines — demo flight booking app (Streamlit + SQLite)
+# SkyLink Airlines — demo flight booking app (Streamlit + SQLite)
 
 No real flights, payments, emails or SMS: everything is simulated and stored in a local SQLite file.
 

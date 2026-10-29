@@ -148,7 +148,7 @@ def sidebar_account():
                 reset_session(keep_user=True)
                 st.session_state.user = found
                 st.rerun()
-        st.write("Demo: admin@demo.com / admin123  |  user@demo.com / user123")
+        st.text("admin@demo.com / admin123  |  user@demo.com / user123")
     with tab_signup:
         name = st.text_input("Full name", key="su_name")
         email2 = st.text_input("Email", key="su_email")

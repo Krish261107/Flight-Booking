@@ -1,10 +1,11 @@
 """Admin pages. Each page is a plain function; app.py decides which one to draw."""
 import datetime as dt
+import re
 
 import pandas as pd
 import streamlit as st
 
-from db import delete_account, get_conn, notify
+from db import AIRCRAFT, delete_account, get_conn, notify
 
 
 def dashboard():
@@ -71,6 +72,178 @@ def dashboard():
     conn.close()
 
 
+MANUAL = "\u270F\uFE0F Type it myself..."
+SLOTS = ["%02d:%02d" % (h, m) for h in range(24) for m in (0, 15, 30, 45)]
+DURATIONS = [str(m) for m in range(60, 301, 15)]
+GATES = ["%s%d" % (letter, n) for letter in "ABCD" for n in range(1, 31)]
+STATUSES = ["Scheduled", "Delayed", "Cancelled"]
+
+
+def _choose(label, options, key, current=None, names=None):
+    """A dropdown with a 'type it myself' option, so any field can be picked or typed.
+    Returns (value, typed_manually)."""
+    opts = [str(o) for o in options]
+    if current is not None and str(current) not in opts:
+        opts.insert(0, str(current))  # an unusual existing value must stay selectable
+    index = opts.index(str(current)) if current is not None else 0
+    names = names or {}
+    pick = st.selectbox(label, opts + [MANUAL], index=index, key=key, format_func=lambda o: names.get(o, o))
+    if pick == MANUAL:
+        return st.text_input(label + " - type it", key=key + "_txt").strip(), True
+    return pick, False
+
+
+def _airport(label, key, airports, current=None):
+    """Returns (code, city_for_new_airport_or_None)."""
+    codes = [a["code"] for a in airports]
+    names = dict((a["code"], "%s \u2014 %s" % (a["code"], a["city"])) for a in airports)
+    code, typed = _choose(label, codes, key, current, names)
+    city = None
+    if typed:
+        code = code.upper()
+        if code and code not in codes:
+            city = st.text_input("City of the new airport %s" % code, key=key + "_city").strip()
+    return code, city
+
+
+def _airline(label, key, airlines, current=None):
+    """Returns (code, name_for_new_airline_or_None)."""
+    codes = [a["code"] for a in airlines]
+    names = dict((a["code"], "%s \u2014 %s" % (a["code"], a["name"])) for a in airlines)
+    code, typed = _choose(label, codes, key, current, names)
+    name = None
+    if typed:
+        code = code.upper()
+        if code and code not in codes:
+            name = st.text_input("Name of the new airline %s" % code, key=key + "_name").strip()
+    return code, name
+
+
+def _flight_form(prefix, conn, f=None):
+    """Draws every flight field (dropdown or typed) and returns (values, errors). `f` is the flight being edited."""
+    d = dict(f) if f else {}
+    airports = conn.execute("SELECT code, city FROM airports ORDER BY city").fetchall()
+    airlines = conn.execute("SELECT code, name FROM airlines ORDER BY name").fetchall()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        airline, new_airline = _airline("Airline", prefix + "al", airlines, d.get("airline_code"))
+    with c2:
+        number = st.text_input("Flight number (e.g. 6E204)", value=d.get("flight_number", ""), key=prefix + "num").strip().upper()
+    with c3:
+        date = st.date_input("Departure date", key=prefix + "date",
+                             value=dt.date.fromisoformat(d["depart_date"]) if d else dt.date.today() + dt.timedelta(days=1))
+    c4, c5 = st.columns(2)
+    with c4:
+        origin, new_o = _airport("From", prefix + "o", airports, d.get("origin"))
+    with c5:
+        dest, new_d = _airport("To", prefix + "d", airports, d.get("destination") or airports[1]["code"])  # new flights: To != From
+    c6, c7 = st.columns(2)
+    with c6:
+        dep, _ = _choose("Departure time", SLOTS, prefix + "dep", d.get("depart_time") or "09:00")
+    with c7:
+        dur_txt, _ = _choose("Duration (minutes)", DURATIONS, prefix + "dur", str(d["duration_min"]) if d else "120")
+
+    errors = []
+    arrive, duration = None, 0
+    if re.match(r"^([01]\d|2[0-3]):[0-5]\d$", dep) and dur_txt.isdigit() and 20 <= int(dur_txt) <= 1000:
+        duration = int(dur_txt)
+        total = int(dep[:2]) * 60 + int(dep[3:]) + duration
+        arrive = "%02d:%02d" % ((total // 60) % 24, total % 60)
+        st.caption("Arrives at %s%s" % (arrive, " (next day)" if total >= 1440 else ""))
+    else:
+        errors.append("Departure time must look like 09:30 and duration must be 20-1000 minutes.")
+
+    c8, c9, c10 = st.columns(3)
+    with c8:
+        stops = st.selectbox("Stops", [0, 1, 2], index=d.get("stops") if d.get("stops") in (0, 1, 2) else 0, key=prefix + "stops")
+    layover, new_l, layover_min = None, None, 0
+    if stops:
+        with c9:
+            layover, new_l = _airport("Layover airport", prefix + "lay", airports, d.get("layover_airport"))
+        with c10:
+            layover_min = int(st.number_input("Layover (minutes)", min_value=20, max_value=600,
+                                              value=int(d.get("layover_min") or 60), key=prefix + "laym"))
+
+    c11, c12, c13, c14 = st.columns(4)
+    with c11:
+        aircraft, _ = _choose("Aircraft", AIRCRAFT, prefix + "ac", d.get("aircraft"))
+    with c12:
+        gate, _ = _choose("Gate", GATES, prefix + "gate", d.get("gate"))
+    with c13:
+        bag_cabin, _ = _choose("Cabin bag", ["5 kg", "7 kg", "10 kg"], prefix + "bagc", d.get("baggage_cabin") or "7 kg")
+    with c14:
+        bag_check, _ = _choose("Check-in bag", ["15 kg", "20 kg", "25 kg", "30 kg"], prefix + "bagk", d.get("baggage_checkin") or "15 kg")
+
+    c15, c16 = st.columns(2)
+    with c15:
+        eco = float(st.number_input("Economy price", min_value=500.0, step=100.0, key=prefix + "eco",
+                                    value=float(d.get("price_economy") or 4000.0)))
+    with c16:
+        auto_biz = st.checkbox("Business fare = 2.6 x economy", value=not d, key=prefix + "autobiz")
+        if auto_biz:
+            biz = round(eco * 2.6, 2)
+            st.caption("Business fare: %s" % format(biz, ",.2f"))
+        else:
+            biz = float(st.number_input("Business price", min_value=500.0, step=100.0, key=prefix + "biz",
+                                        value=float(d.get("price_business") or eco * 2.6)))
+    status, delay = "Scheduled", 0
+    if f:
+        c17, c18 = st.columns(2)
+        with c17:
+            status = st.selectbox("Status", STATUSES, index=STATUSES.index(d["status"]) if d["status"] in STATUSES else 0, key=prefix + "status")
+        if status == "Delayed":
+            with c18:
+                delay = int(st.number_input("Delay (minutes)", min_value=5, max_value=720, value=int(d.get("delay_min") or 30), key=prefix + "delay"))
+
+    if not re.match(r"^[A-Z0-9]{3,8}$", number):
+        errors.append("Flight number must be 3-8 letters/digits, like 6E204.")
+    if not re.match(r"^[A-Z0-9]{2,3}$", airline):
+        errors.append("Airline code must be 2-3 letters/digits.")
+    elif new_airline is not None and not new_airline:
+        errors.append("Enter a name for the new airline %s." % airline)
+    for label, code, city in (("From", origin, new_o), ("To", dest, new_d)):
+        if not re.match(r"^[A-Z]{3}$", code):
+            errors.append("%s airport code must be 3 letters." % label)
+        elif city is not None and not city:
+            errors.append("Enter the city of the new airport %s." % code)
+    if origin == dest:
+        errors.append("From and To must be different airports.")
+    if stops:
+        if not re.match(r"^[A-Z]{3}$", layover or ""):
+            errors.append("Layover airport code must be 3 letters.")
+        elif layover in (origin, dest):
+            errors.append("Layover airport must differ from From and To.")
+        elif new_l is not None and not new_l:
+            errors.append("Enter the city of the new airport %s." % layover)
+    if not aircraft or not gate or not bag_cabin or not bag_check:
+        errors.append("Aircraft, gate and baggage can't be empty.")
+    values = dict(airline=airline, new_airline=new_airline, number=number, date=date.isoformat(), origin=origin, dest=dest,
+                  new_o=new_o, new_d=new_d, dep=dep, arrive=arrive, duration=duration, stops=stops, layover=layover if stops else None,
+                  new_l=new_l, layover_min=layover_min, aircraft=aircraft, gate=gate, bag_cabin=bag_cabin, bag_check=bag_check,
+                  eco=eco, biz=biz, status=status, delay=delay)
+    return values, errors
+
+
+def _save_new_refs(conn, v):
+    """Create the airline / airports the admin typed in, if they didn't exist yet."""
+    if v["new_airline"]:
+        conn.execute("INSERT OR IGNORE INTO airlines VALUES (?,?)", (v["airline"], v["new_airline"]))
+    for code, city in ((v["origin"], v["new_o"]), (v["dest"], v["new_d"]), (v["layover"], v["new_l"])):
+        if city:
+            conn.execute("INSERT OR IGNORE INTO airports VALUES (?,?,?)", (code, city, city + " Airport"))
+
+
+def _duplicate(conn, v, skip_id=0):
+    return conn.execute("SELECT 1 FROM flights WHERE flight_number=? AND depart_date=? AND id!=?",
+                        (v["number"], v["date"], skip_id)).fetchone()
+
+
+def _show(errors):
+    for e in dict.fromkeys(errors):
+        st.error(e)
+
+
 def flights():
     st.title("\U0001F6E0\ufe0f Flights & Fares")
 
@@ -78,43 +251,136 @@ def flights():
     if not user or not user.get("is_admin"):
         st.error("Admin access only.")
         st.stop()
+    flash = st.session_state.pop("flights_flash", None)
+    if flash:
+        st.success(flash)
 
     conn = get_conn()
-    tab1, tab2 = st.tabs(["Browse & edit a flight", "Bulk delay / cancel a route"])
+    tab_edit, tab_add, tab_bulk = st.tabs(["Edit or delete a flight", "Add a flight", "Bulk delay / cancel a route"])
 
-    with tab1:
-        flights = pd.read_sql_query(
-            "SELECT id, flight_number, airline_code, origin, destination, depart_date, depart_time, "
-            "price_economy, price_business, status, delay_min, gate FROM flights ORDER BY depart_date LIMIT 300",
-            conn,
-        )
-        st.dataframe(flights, height=300)
-
-        st.markdown("**Update a flight**")
-        fid = st.number_input("Flight ID", min_value=1, step=1)
-        f_row = conn.execute("SELECT * FROM flights WHERE id=?", (int(fid),)).fetchone() if fid else None
-        if f_row:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                new_eco = st.number_input("Economy price", value=float(f_row["price_economy"]))
-            with c2:
-                new_biz = st.number_input("Business price", value=float(f_row["price_business"]))
-            with c3:
-                statuses = ["Scheduled", "Delayed", "Cancelled"]
-                new_status = st.selectbox("Status", statuses, index=statuses.index(f_row["status"]) if f_row["status"] in statuses else 0)
-            with c4:
-                new_delay = st.number_input("Delay (min)", value=int(f_row["delay_min"]), min_value=0)
-            if new_status != "Delayed":
-                new_delay = 0  # a delay only makes sense for a delayed flight
-            if st.button("Save changes"):
-                conn.execute("UPDATE flights SET price_economy=?, price_business=?, status=?, delay_min=? WHERE id=?",
-                             (new_eco, new_biz, new_status, new_delay, int(fid)))
+    # ------------------------------------------------------------------ add
+    with tab_add:
+        v, errs = _flight_form("add_", conn)
+        if st.button("Add flight", type="primary", key="add_btn"):
+            errs = list(errs)
+            if not errs:
+                if _duplicate(conn, v):
+                    errs.append("Flight %s already exists on %s." % (v["number"], v["date"]))
+                if dt.datetime.fromisoformat(v["date"] + "T" + v["dep"]) <= dt.datetime.now():
+                    errs.append("That departure time is already in the past.")
+            if errs:
+                _show(errs)
+            else:
+                _save_new_refs(conn, v)
+                new_id = conn.execute(
+                    """INSERT INTO flights (flight_number, airline_code, origin, destination, depart_date, depart_time, arrive_time,
+                       duration_min, stops, layover_airport, layover_min, aircraft, base_price, seats_economy, seats_business,
+                       price_economy, price_business, baggage_cabin, baggage_checkin, status, delay_min, gate)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,150,20,?,?,?,?,'Scheduled',0,?)""",
+                    (v["number"], v["airline"], v["origin"], v["dest"], v["date"], v["dep"], v["arrive"], v["duration"], v["stops"],
+                     v["layover"], v["layover_min"], v["aircraft"], v["eco"], v["eco"], v["biz"], v["bag_cabin"], v["bag_check"],
+                     v["gate"])).lastrowid
                 conn.commit()
-                st.success("Flight updated.")
-        else:
-            st.caption("Enter a valid flight ID above to edit it.")
+                st.success("Added flight %s (ID %d): %s to %s on %s at %s." %
+                           (v["number"], new_id, v["origin"], v["dest"], v["date"], v["dep"]))
 
-    with tab2:
+    # ----------------------------------------------------------------- edit
+    with tab_edit:
+        with st.expander("All flights (first 300)"):
+            st.dataframe(pd.read_sql_query(
+                "SELECT id, flight_number, airline_code, origin, destination, depart_date, depart_time, "
+                "price_economy, price_business, status, delay_min, gate FROM flights ORDER BY depart_date, depart_time LIMIT 300", conn),
+                height=250)
+        mode = st.radio("Find the flight by", ["Route & date (dropdown)", "Flight ID or number (type it)"], horizontal=True, key="fl_find")
+        rows = []
+        if mode.startswith("Route"):
+            airports = conn.execute("SELECT code, city FROM airports ORDER BY city").fetchall()
+            names = dict((a["code"], "%s \u2014 %s" % (a["code"], a["city"])) for a in airports)
+            names["Any"] = "Any"
+            codes = ["Any"] + [a["code"] for a in airports]
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                fo = st.selectbox("From", codes, key="fl_o", format_func=lambda o: names[o])
+            with c2:
+                fd = st.selectbox("To", codes, key="fl_d", format_func=lambda o: names[o])
+            with c3:
+                fdate = st.date_input("Date", key="fl_date", value=dt.date.today())
+                any_date = st.checkbox("Any date", key="fl_anyd")
+            sql, args = "SELECT * FROM flights WHERE 1=1", []
+            if fo != "Any":
+                sql, args = sql + " AND origin=?", args + [fo]
+            if fd != "Any":
+                sql, args = sql + " AND destination=?", args + [fd]
+            if not any_date:
+                sql, args = sql + " AND depart_date=?", args + [fdate.isoformat()]
+            rows = conn.execute(sql + " ORDER BY depart_date, depart_time LIMIT 100", args).fetchall()
+        else:
+            q = st.text_input("Flight ID (e.g. 120) or flight number (e.g. 6E204)", key="fl_q").strip().upper()
+            if q:
+                rows = (conn.execute("SELECT * FROM flights WHERE id=?", (int(q),)) if q.isdigit() else
+                        conn.execute("SELECT * FROM flights WHERE flight_number=? ORDER BY depart_date LIMIT 100", (q,))).fetchall()
+        if not rows:
+            st.info("No flights found. Change the filters above, or add one in the next tab.")
+        else:
+            labels = dict(("#%d | %s | %s \u2192 %s | %s %s | %s" % (r["id"], r["flight_number"], r["origin"], r["destination"],
+                                                                    r["depart_date"], r["depart_time"], r["status"]), r) for r in rows)
+            f = labels[st.selectbox("Choose the flight (%d found)" % len(rows), list(labels), key="fl_pick")]
+            fid, prefix = f["id"], "ed%d_" % f["id"]
+            booked = conn.execute("SELECT COUNT(DISTINCT b.id) n FROM booking_segments bs JOIN bookings b ON b.id=bs.booking_id "
+                                  "WHERE bs.flight_id=? AND b.status='Confirmed'", (fid,)).fetchone()["n"]
+            ever = conn.execute("SELECT COUNT(*) n FROM booking_segments WHERE flight_id=?", (fid,)).fetchone()["n"]
+            if booked:
+                st.info("%d confirmed booking(s) on this flight, so route and date are locked. Changes to timing, gate, "
+                        "airline or status notify those passengers." % booked)
+            st.divider()
+            v, errs = _flight_form(prefix, conn, f)
+            if st.button("Save changes", type="primary", key=prefix + "save"):
+                errs = list(errs)
+                if not errs:
+                    if booked and (v["origin"], v["dest"], v["date"]) != (f["origin"], f["destination"], f["depart_date"]):
+                        errs.append("Route and date can't change while passengers are booked. Cancel the flight instead.")
+                    if _duplicate(conn, v, fid):
+                        errs.append("Flight %s already exists on %s." % (v["number"], v["date"]))
+                if errs:
+                    _show(errs)
+                else:
+                    _save_new_refs(conn, v)
+                    conn.execute(
+                        """UPDATE flights SET flight_number=?, airline_code=?, origin=?, destination=?, depart_date=?, depart_time=?,
+                           arrive_time=?, duration_min=?, stops=?, layover_airport=?, layover_min=?, aircraft=?, base_price=?,
+                           price_economy=?, price_business=?, baggage_cabin=?, baggage_checkin=?, status=?, delay_min=?, gate=?
+                           WHERE id=?""",
+                        (v["number"], v["airline"], v["origin"], v["dest"], v["date"], v["dep"], v["arrive"], v["duration"], v["stops"],
+                         v["layover"], v["layover_min"], v["aircraft"], v["eco"], v["eco"], v["biz"], v["bag_cabin"], v["bag_check"],
+                         v["status"], v["delay"], v["gate"], fid))
+                    schedule_changed = (f["flight_number"], f["airline_code"], f["depart_time"], f["duration_min"], f["gate"]) != \
+                        (v["number"], v["airline"], v["dep"], v["duration"], v["gate"])
+                    status_changed = (f["status"], f["delay_min"] or 0) != (v["status"], v["delay"])
+                    told = 0
+                    if booked and (schedule_changed or status_changed):
+                        for p in conn.execute("SELECT DISTINCT b.user_id, b.pnr FROM booking_segments bs JOIN bookings b ON b.id=bs.booking_id "
+                                              "WHERE bs.flight_id=? AND b.status='Confirmed'", (fid,)).fetchall():
+                            text = "Flight %s (%s to %s, %s) now departs at %s, gate %s, status %s." % (
+                                v["number"], v["origin"], v["dest"], v["date"], v["dep"], v["gate"], v["status"])
+                            notify(conn, p["user_id"], "Push", "Flight update - PNR " + p["pnr"], text)
+                            told += 1
+                    conn.commit()
+                    st.success("Flight %s saved.%s" % (v["number"], " %d passenger(s) notified." % told if told else ""))
+
+            with st.expander("Delete this flight"):
+                if ever:
+                    st.warning("This flight appears in %d booking record(s), so deleting it would break them. Set its status to "
+                               "Cancelled instead: passengers are then flagged and can claim a full refund in My Bookings." % ever)
+                elif st.checkbox("I understand this permanently deletes flight %s" % f["flight_number"], key=prefix + "delok") \
+                        and st.button("Delete flight", key=prefix + "del"):
+                    conn.execute("DELETE FROM seats WHERE flight_id=?", (fid,))
+                    conn.execute("DELETE FROM flights WHERE id=?", (fid,))
+                    conn.commit()
+                    st.session_state["flights_flash"] = "Flight %s (ID %d) deleted." % (f["flight_number"], fid)
+                    st.rerun()
+
+    # ----------------------------------------------------------------- bulk
+    with tab_bulk:
         st.caption("Apply a delay or cancellation to every flight on a route/date in one go, and notify "
                    "every booked passenger automatically.")
         airports = [a["code"] for a in conn.execute("SELECT code FROM airports").fetchall()]
